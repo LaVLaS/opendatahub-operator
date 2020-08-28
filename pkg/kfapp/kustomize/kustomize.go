@@ -148,6 +148,79 @@ func (kustomize *kustomize) initK8sClients() error {
 	return nil
 }
 
+func (kustomize *kustomize) render(app kfconfig.Application) ([]byte, error) {
+	kustomizeDir := path.Join(kustomize.kfDef.Spec.AppDir, outputDir)
+	resMap, err := EvaluateKustomizeManifest(path.Join(kustomizeDir, app.Name))
+	if err != nil {
+		log.Errorf("Error evaluating kustomization manifest for %v: %v", app.Name, err)
+		return nil, &kfapisv3.KfError{
+			Code:    int(kfapisv3.INTERNAL_ERROR),
+			Message: fmt.Sprintf("error evaluating kustomization manifest for %v: %v", app.Name, err),
+		}
+	}
+
+	sortResourceByKind(resMap, utils.InstallOrder)
+
+	// check to set owner references for resources if installed through kubeflow operator
+	annotations := kustomize.kfDef.GetAnnotations()
+	setOwnerReference := false
+	if setOwner, ok := annotations[strings.Join([]string{utils.KfDefAnnotation, utils.SetOwnerReference}, "/")]; ok {
+		if setOwnerBool, err := strconv.ParseBool(setOwner); err == nil {
+			setOwnerReference = setOwnerBool
+		}
+	}
+
+	//TODO this should be streamed
+	var data []byte
+	if setOwnerReference {
+		// retrieve the UID of the KfDef resource using dynamic client
+		config, _ := rest.InClusterConfig()
+		dyn, err := dynamic.NewForConfig(config)
+		if err != nil {
+			return nil, &kfapisv3.KfError{
+				Code:    int(kfapisv3.INTERNAL_ERROR),
+				Message: fmt.Sprintf("failed to create dynamic client: %v", err),
+			}
+		}
+		kfDefRes := schema.GroupVersionResource{Group: "kfdef.apps.kubeflow.org", Version: "v1", Resource: "kfdefs"}
+		instance, err := dyn.Resource(kfDefRes).Namespace(kustomize.kfDef.GetNamespace()).Get(kustomize.kfDef.GetName(), metav1.GetOptions{})
+		if err != nil {
+			return nil, &kfapisv3.KfError{
+				Code:    int(kfapisv3.INTERNAL_ERROR),
+				Message: fmt.Sprintf("failed to get the KfDef object: %v", err),
+			}
+		}
+		data, err = GenerateYamlWithOwnerReferences(resMap, instance)
+		if err != nil {
+			return nil, &kfapisv3.KfError{
+				Code:    int(kfapisv3.INTERNAL_ERROR),
+				Message: fmt.Sprintf("can not encode component %v as yaml: %v", app.Name, err),
+			}
+		}
+	} else {
+		data, err = resMap.AsYaml()
+		if err != nil {
+			return nil, &kfapisv3.KfError{
+				Code:    int(kfapisv3.INTERNAL_ERROR),
+				Message: fmt.Sprintf("can not encode component %v as yaml: %v", app.Name, err),
+			}
+		}
+	}
+	return data, nil
+}
+
+// Dump prints the kustomize generated resources to stdout
+func (kustomize *kustomize) Dump(resources kftypesv3.ResourceEnum) error {
+	for _, app := range kustomize.kfDef.Spec.Applications {
+		data, err := kustomize.render(app)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(data))
+	}
+	return nil
+}
+
 // Apply deploys kustomize generated resources to the kubenetes api server
 func (kustomize *kustomize) Apply(resources kftypesv3.ResourceEnum) error {
 	var restConfig *rest.Config = nil
@@ -173,62 +246,11 @@ func (kustomize *kustomize) Apply(resources kftypesv3.ResourceEnum) error {
 		}
 	}
 
-	kustomizeDir := path.Join(kustomize.kfDef.Spec.AppDir, outputDir)
 	for _, app := range kustomize.kfDef.Spec.Applications {
 		log.Infof("Deploying application %v", app.Name)
-		resMap, err := EvaluateKustomizeManifest(path.Join(kustomizeDir, app.Name))
+		data, err := kustomize.render(app)
 		if err != nil {
-			log.Errorf("Error evaluating kustomization manifest for %v: %v", app.Name, err)
-			return &kfapisv3.KfError{
-				Code:    int(kfapisv3.INTERNAL_ERROR),
-				Message: fmt.Sprintf("error evaluating kustomization manifest for %v: %v", app.Name, err),
-			}
-		}
-
-		// check to set owner references for resources if installed through kubeflow operator
-		annotations := kustomize.kfDef.GetAnnotations()
-		setOwnerReference := false
-		if setOwner, ok := annotations[strings.Join([]string{utils.KfDefAnnotation, utils.SetOwnerReference}, "/")]; ok {
-			if setOwnerBool, err := strconv.ParseBool(setOwner); err == nil {
-				setOwnerReference = setOwnerBool
-			}
-		}
-
-		//TODO this should be streamed
-		var data []byte
-		if setOwnerReference {
-			// retrieve the UID of the KfDef resource using dynamic client
-			config, _ := rest.InClusterConfig()
-			dyn, err := dynamic.NewForConfig(config)
-			if err != nil {
-				return &kfapisv3.KfError{
-					Code:    int(kfapisv3.INTERNAL_ERROR),
-					Message: fmt.Sprintf("failed to create dynamic client: %v", err),
-				}
-			}
-			kfDefRes := schema.GroupVersionResource{Group: "kfdef.apps.kubeflow.org", Version: "v1", Resource: "kfdefs"}
-			instance, err := dyn.Resource(kfDefRes).Namespace(kustomize.kfDef.GetNamespace()).Get(kustomize.kfDef.GetName(), metav1.GetOptions{})
-			if err != nil {
-				return &kfapisv3.KfError{
-					Code:    int(kfapisv3.INTERNAL_ERROR),
-					Message: fmt.Sprintf("failed to get the KfDef object: %v", err),
-				}
-			}
-			data, err = GenerateYamlWithOwnerReferences(resMap, instance)
-			if err != nil {
-				return &kfapisv3.KfError{
-					Code:    int(kfapisv3.INTERNAL_ERROR),
-					Message: fmt.Sprintf("can not encode component %v as yaml: %v", app.Name, err),
-				}
-			}
-		} else {
-			data, err = resMap.AsYaml()
-			if err != nil {
-				return &kfapisv3.KfError{
-					Code:    int(kfapisv3.INTERNAL_ERROR),
-					Message: fmt.Sprintf("can not encode component %v as yaml: %v", app.Name, err),
-				}
-			}
+			return err
 		}
 
 		// TODO(https://github.com/kubeflow/manifests/issues/806): Bump the timeout because cert-manager takes
@@ -387,6 +409,10 @@ func (kustomize *kustomize) Delete(resources kftypesv3.ResourceEnum) error {
 				Message: fmt.Sprintf("error evaluating kustomization manifest for %v: %v", app.Name, err),
 			}
 		}
+
+		// Sort resources by kind to make sure we don't experience namespace terminating hanging.
+		sortResourceByKind(resMap, utils.UninstallOrder)
+
 		yamlBytes, err := resMap.AsYaml()
 		if err != nil {
 			return &kfapisv3.KfError{
@@ -402,7 +428,6 @@ func (kustomize *kustomize) Delete(resources kftypesv3.ResourceEnum) error {
 			}
 		}
 		for _, r := range resources {
-
 			err := utils.DeleteResource(r, kubeclient, 5*time.Minute)
 			if err != nil {
 				msg := fmt.Sprintf("error evaluating kustomization manifest for %v: %v", app.Name, err)
@@ -444,6 +469,21 @@ func (kustomize *kustomize) Delete(resources kftypesv3.ResourceEnum) error {
 	}
 
 	return nil
+}
+
+// sortResourceByKind does in-place sort of resources by Kind.
+func sortResourceByKind(resMap resmap.ResMap, order utils.SortOrder) {
+	resourcesInUninstallOrder := utils.SortByKind(resMap.Resources(), order)
+
+	// Need to remove existing resource and append them in order.
+	allIdsToRemove := resMap.AllIds()
+	for _, idToRemove := range allIdsToRemove {
+		resMap.Remove(idToRemove)
+	}
+
+	for _, resourceToAdd := range resourcesInUninstallOrder {
+		resMap.Append(resourceToAdd)
+	}
 }
 
 // Generate is called from 'kfctl generate ...' and produces yaml output files under <deployment>/kustomize.
@@ -823,6 +863,13 @@ func MergeKustomization(compDir string, targetDir string, kfDef *kfconfig.KfConf
 	}
 
 	updateGeneratorArgs := func(parentGeneratorArgs *types.GeneratorArgs, childGeneratorArgs types.GeneratorArgs) {
+		if childGeneratorArgs.EnvSources != nil && len(childGeneratorArgs.EnvSources) > 0 {
+			parentGeneratorArgs.EnvSources = make([]string, 0)
+			for _, envSource := range childGeneratorArgs.EnvSources {
+				envAbsolutePathSource := path.Join(targetDir, envSource)
+				parentGeneratorArgs.EnvSources = append(parentGeneratorArgs.EnvSources, extractSuffix(compDir, envAbsolutePathSource))
+			}
+		}
 		if childGeneratorArgs.EnvSource != "" {
 			envAbsolutePathSource := path.Join(targetDir, childGeneratorArgs.EnvSource)
 			envSource := extractSuffix(compDir, envAbsolutePathSource)

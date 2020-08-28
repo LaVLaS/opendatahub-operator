@@ -1,11 +1,12 @@
-
 approvers:
   - adrian555
   - animeshsingh
-  - gabrielwen
-  - kkasravi
-  - kunmingg
-  - jlewi
+  - crobby
+  - Jeffwan
+  - vpavlin
   - yanniszark
 reviewers:
+  - adrian555
+  - pdmack
   - tomcli
+  - PatrickXYS
